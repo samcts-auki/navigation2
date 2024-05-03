@@ -125,9 +125,16 @@ StaticLayer::getParameters()
   declareParameter("map_subscribe_transient_local", rclcpp::ParameterValue(true));
   declareParameter("transform_tolerance", rclcpp::ParameterValue(0.0));
   declareParameter("map_topic", rclcpp::ParameterValue(""));
+  declareParameter("footprint_clearing_enabled", rclcpp::ParameterValue(false));
 
-  node_->get_parameter(name_ + "." + "enabled", enabled_);
-  node_->get_parameter(name_ + "." + "subscribe_to_updates", subscribe_to_updates_);
+  auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error{"Failed to lock node"};
+  }
+
+  node->get_parameter(name_ + "." + "enabled", enabled_);
+  node->get_parameter(name_ + "." + "subscribe_to_updates", subscribe_to_updates_);
+  node->get_parameter(name_ + "." + "footprint_clearing_enabled", footprint_clearing_enabled_);
   std::string private_map_topic, global_map_topic;
   node_->get_parameter(name_ + "." + "map_topic", private_map_topic);
   node_->get_parameter("map_topic", global_map_topic);
@@ -318,7 +325,7 @@ StaticLayer::incomingUpdate(map_msgs::msg::OccupancyGridUpdate::ConstSharedPtr u
 
 void
 StaticLayer::updateBounds(
-  double /*robot_x*/, double /*robot_y*/, double /*robot_yaw*/, double * min_x,
+  double robot_x, double robot_y, double robot_yaw, double * min_x,
   double * min_y,
   double * max_x,
   double * max_y)
@@ -355,6 +362,24 @@ StaticLayer::updateBounds(
   *max_y = std::max(wy, *max_y);
 
   has_updated_data_ = false;
+
+  updateFootprint(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
+}
+
+void
+StaticLayer::updateFootprint(
+  double robot_x, double robot_y, double robot_yaw,
+  double * min_x, double * min_y,
+  double * max_x,
+  double * max_y)
+{
+  if (!footprint_clearing_enabled_) {return;}
+
+  transformFootprint(robot_x, robot_y, robot_yaw, getFootprint(), transformed_footprint_);
+
+  for (unsigned int i = 0; i < transformed_footprint_.size(); i++) {
+    touch(transformed_footprint_[i].x, transformed_footprint_[i].y, min_x, min_y, max_x, max_y);
+  }
 }
 
 void
@@ -375,6 +400,10 @@ StaticLayer::updateCosts(
     }
     update_in_progress_.store(false);
     return;
+  }
+
+  if (footprint_clearing_enabled_) {
+    setConvexPolygonCost(transformed_footprint_, nav2_costmap_2d::FREE_SPACE);
   }
 
   if (!layered_costmap_->isRolling()) {
@@ -421,7 +450,53 @@ StaticLayer::updateCosts(
       }
     }
   }
-  update_in_progress_.store(false);
+  current_ = true;
+}
+
+/**
+  * @brief Callback executed when a parameter change is detected
+  * @param event ParameterEvent message
+  */
+rcl_interfaces::msg::SetParametersResult
+StaticLayer::dynamicParametersCallback(
+  std::vector<rclcpp::Parameter> parameters)
+{
+  std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
+  rcl_interfaces::msg::SetParametersResult result;
+
+  for (auto parameter : parameters) {
+    const auto & param_type = parameter.get_type();
+    const auto & param_name = parameter.get_name();
+
+    if (param_name == name_ + "." + "map_subscribe_transient_local" ||
+      param_name == name_ + "." + "map_topic" ||
+      param_name == name_ + "." + "subscribe_to_updates")
+    {
+      RCLCPP_WARN(
+        logger_, "%s is not a dynamic parameter "
+        "cannot be changed while running. Rejecting parameter update.", param_name.c_str());
+    } else if (param_type == ParameterType::PARAMETER_DOUBLE) {
+      if (param_name == name_ + "." + "transform_tolerance") {
+        transform_tolerance_ = tf2::durationFromSec(parameter.as_double());
+      }
+    } else if (param_type == ParameterType::PARAMETER_BOOL) {
+      if (param_name == name_ + "." + "enabled" && enabled_ != parameter.as_bool()) {
+        enabled_ = parameter.as_bool();
+
+        x_ = y_ = 0;
+        width_ = size_x_;
+        height_ = size_y_;
+        has_updated_data_ = true;
+        current_ = false;
+      }
+    } else if (param_type == ParameterType::PARAMETER_BOOL) {
+      if (param_name == name_ + "." + "footprint_clearing_enabled") {
+        footprint_clearing_enabled_ = parameter.as_bool();
+      }
+    }
+  }
+  result.successful = true;
+  return result;
 }
 
 }  // namespace nav2_costmap_2d
